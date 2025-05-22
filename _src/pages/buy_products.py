@@ -2,7 +2,8 @@ import asyncio
 import asyncpg
 import streamlit as st
 from contextlib import asynccontextmanager
-
+from _src.pages.redis_client import RedisClient, cache_to_redis, invalidate_cache
+redis_client = RedisClient()
 
 
 @asynccontextmanager
@@ -21,7 +22,7 @@ async def get_db_connection():
         if conn:
             await conn.close()
 
-
+@cache_to_redis("products", ttl=300)
 async def fetch_products(search_query=None, brand_filter=None, category_filter=None):
     """Получение информации о продуктах из базы данных с учетом фильтров."""
     async with get_db_connection() as conn:
@@ -58,6 +59,7 @@ async def fetch_products(search_query=None, brand_filter=None, category_filter=N
         result = await conn.fetch(query, *params)
         return result
 
+@cache_to_redis("brands", ttl=300)
 async def fetch_brands():
     """Получение списка брендов из базы данных."""
     async with get_db_connection() as conn:
@@ -65,7 +67,7 @@ async def fetch_brands():
         result = await conn.fetch(query)
         return [record['brand_name'] for record in result]
 
-
+@cache_to_redis("categories", ttl=300)
 async def fetch_categories():
     """Получение списка категорий из базы данных."""
     async with get_db_connection() as conn:
@@ -117,6 +119,7 @@ async def add_to_cart(product_id, name, price, quantity):
 
     await update_order_summary(order_id)  # Обновляем стоимость заказа в таблице orders
     st.success(f"Товар '{name}' ({quantity} шт.) успешно добавлен в корзину!")
+    invalidate_cache("products")
 
 
 async def create_new_order(customer_id):

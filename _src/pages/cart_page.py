@@ -3,6 +3,9 @@ import asyncio
 import asyncpg
 import streamlit as st
 from contextlib import asynccontextmanager
+import pickle
+from datetime import timedelta
+from _src.pages.log_user import redis_sessions
 
 @asynccontextmanager
 async def get_db_connection():
@@ -154,6 +157,18 @@ def clear_cart():
     """Очистка корзины."""
     st.session_state.cart = {}
 
+def get_cart_from_redis(user_id):
+    if redis_sessions:
+        cart_data = redis_sessions.get(f"cart:{user_id}")
+        return pickle.loads(cart_data) if cart_data else {}
+    return {}
+
+def save_cart_to_redis(user_id, cart):
+    if redis_sessions:
+        redis_sessions.setex(
+            f"cart:{user_id}",
+            timedelta(days=1),
+            pickle.dumps(cart))
 
 def cart_page(customer_id):
     """Страница корзины."""
@@ -167,7 +182,7 @@ def cart_page(customer_id):
 
     # Грузим корзину из базы в session_state
     if 'cart' not in st.session_state:
-        asyncio.run(load_cart_from_database(order_id))
+        st.session_state.cart = get_cart_from_redis(customer_id)
 
     cart_items = st.session_state.cart
 
@@ -255,3 +270,5 @@ def cart_page(customer_id):
                 st.rerun()
     else:
         st.write("Ваша корзина пуста.")
+
+    save_cart_to_redis(customer_id, st.session_state.cart)

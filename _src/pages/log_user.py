@@ -6,6 +6,22 @@ import nest_asyncio
 from contextlib import asynccontextmanager
 import time
 nest_asyncio.apply()
+from datetime import timedelta
+import pickle
+import uuid
+
+redis_sessions = None
+
+try:
+    import redis
+    redis_sessions = redis.Redis(
+        host='localhost',
+        port=6379,
+        db=1,
+        decode_responses=True)
+
+except ImportError:
+    st.error("Redis не установлен")
 
 # ----- Асинхронное подключение к базе данных -----
 @asynccontextmanager
@@ -61,19 +77,22 @@ def login_form():
 
         if login_button:
             user_data = asyncio.run(check_customer(username))
-            if user_data:
-                stored_password = user_data[3]
-                if bcrypt.checkpw(password.encode('utf-8'), stored_password.encode('utf-8')):
-                    st.session_state['logged_in'] = True
-                    st.session_state['user_id'] = user_data[2]
-                    st.session_state['role'] = user_data[6]
-                    st.session_state['username'] = username
-                    st.success("Вы успешно вошли!")
-                    st.rerun()
-                else:
-                    st.error("Неверный пароль.")
-            else:
-                st.error("Пользователь не найден.")
+            stored_password = user_data[3]
+            if user_data and bcrypt.checkpw(password.encode('utf-8'), stored_password.encode('utf-8')):
+                session_id = str(uuid.uuid4())
+                redis_sessions.setex(
+                    f"session:{session_id}",
+                    timedelta(hours=2),
+                    pickle.dumps({
+                        'logged_in': True,
+                        'user_id': user_data[2],
+                        'cart' : {},
+                        'role': user_data[6],
+                        'username': username
+                    })
+                )
+                st.session_state['session_id'] = session_id
+                st.rerun()
 
 def registration_form():
     st.title("Регистрация пользователя")
@@ -104,5 +123,6 @@ def registration_form():
 
 
 def log_out():
-    st.session_state['logged_in'] = False
-    st.rerun()
+    if 'session_id' in st.session_state:
+        redis_sessions.delete(f"session:{st.session_state['session_id']}")
+    st.session_state.clear()

@@ -1,5 +1,6 @@
-streamlit
-bcrypt
-asyncpg
-nest-asyncio
-pandas
+streamlit~=1.41.0
+bcrypt~=4.2.1
+asyncpg~=0.30.0
+nest-asyncio~=1.6.0
+pandas~=2.2.3
+redis~=6.1.0

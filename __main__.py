@@ -7,9 +7,33 @@ from _src.pages import edit_managers
 from _src.pages import cart_page
 from _src.pages import customer_page
 from _src.pages import main_window
-
+import redis
+import pickle
 
 async def main():
+    redis_sessions = redis.Redis(host='localhost', port=6379, db=1, decode_responses=False)
+    session_data = None
+    if 'session_id' in st.session_state:
+        try:
+            session_data = redis_sessions.get(f"session:{st.session_state.session_id}")
+            if session_data:
+                session_data = pickle.loads(session_data)
+                st.session_state.update(session_data)
+        except redis.ConnectionError:
+            st.warning("Не удалось подключиться к Redis. Используются локальные данные сессии.")
+
+    defaults = {
+        'logged_in': False,
+        'user_id': None,
+        'cart': {},
+        'role': None,
+        'username': None
+    }
+    if session_data:
+        for key, value in session_data.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
     if 'user_id' not in st.session_state:
