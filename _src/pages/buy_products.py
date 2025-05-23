@@ -2,6 +2,8 @@ import asyncio
 import asyncpg
 import streamlit as st
 from contextlib import asynccontextmanager
+import pickle
+from datetime import timedelta
 from _src.pages.redis_client import RedisClient, cache_to_redis, invalidate_cache
 redis_client = RedisClient()
 
@@ -108,7 +110,6 @@ async def add_to_cart(product_id, name, price, quantity):
         st.info("Товар уже у вас в корзине")
         return
     else:
-        # Добавляем новый товар в корзину и базу
         st.session_state.cart[product_id] = {
             'name': name,
             'price': price,
@@ -117,7 +118,7 @@ async def add_to_cart(product_id, name, price, quantity):
 
         await add_item_to_order(order_id, product_id, quantity, price)
 
-    await update_order_summary(order_id)  # Обновляем стоимость заказа в таблице orders
+    await update_order_summary(order_id)
     st.success(f"Товар '{name}' ({quantity} шт.) успешно добавлен в корзину!")
     invalidate_cache("products")
 
@@ -166,6 +167,15 @@ async def update_order_summary(order_id):
 
 def purchase_page(customer_id):
     """Страница просмотра товаров и добавления в корзину."""
+    try:
+        # Пытаемся прочитать что-то из кеша
+        test_key = "products:test"
+        RedisClient().client.setex(test_key, timedelta(minutes=1), pickle.dumps({"test": "data"}))
+        cached = pickle.loads(RedisClient().client.get(test_key))
+        st.sidebar.success(f"Кеш работает: {cached}")
+    except Exception as e:
+        st.sidebar.error(f"Ошибка кеша: {str(e)}")
+
     st.title("Покупка товаров")
     st.sidebar.info("🔵 Используйте эту страницу для оформления покупок.")
 
@@ -233,6 +243,7 @@ def purchase_page(customer_id):
                                 st.error("Недостаточно товара на складе для добавления в корзину.")
             else:
                 st.warning(f"Товара {product['name']} пока нет в наличии")
+
 
     elif products is None:
         st.warning("Список товаров временно недоступен.")

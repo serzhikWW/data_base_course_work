@@ -5,6 +5,40 @@ from contextlib import asynccontextmanager
 import pandas as pd
 import time
 
+
+import redis
+import pickle
+from datetime import timedelta
+
+# Инициализация Redis
+redis_client = redis.Redis(
+    host='localhost',
+    port=6379,
+    db=0,
+    decode_responses=False
+)
+
+def get_user_role_from_cache(user_id):
+    """Получаем роль пользователя из кеша Redis"""
+    try:
+        cached_data = redis_client.get(f"user:{user_id}")
+        if cached_data:
+            return pickle.loads(cached_data)['role']
+        return None
+    except:
+        return None
+
+def cache_user_data(user_id, user_data, ttl=3600):
+    """Кешируем данные пользователя"""
+    try:
+        redis_client.setex(
+            f"user:{user_id}",
+            timedelta(seconds=ttl),
+            pickle.dumps(user_data))
+    except Exception as e:
+        print(f"Redis cache error: {e}")
+
+
 # Асинхронный контекст для подключения к базе данных
 @asynccontextmanager
 async def get_connection():
@@ -22,14 +56,24 @@ async def get_connection():
         if conn:
             await conn.close()
 
-async def check_customer(id):
+
+async def check_customer_with_cache(id):
+    """Проверка пользователя с кешированием"""
+    # Сначала проверяем кеш
+    cached_role = get_user_role_from_cache(id)
+    if cached_role:
+        return {'role': cached_role}
+
+    # Если нет в кеше, запрашиваем из БД
     async with get_connection() as conn:
-        query = '''SELECT * 
+        query = '''SELECT customers.*, roles.role 
                    FROM customers 
-                   JOIN roles ON customers.ROLE = roles.id
+                   JOIN roles ON customers.role = roles.id
                    WHERE customers.id = $1'''
-        user = await conn.fetchrow(query, id)
-        return user
+        user_data = await conn.fetchrow(query, id)
+        if user_data:
+            cache_user_data(id, dict(user_data))
+        return user_data
 
 
 # Асинхронная функция для получения продуктов в формате DataFrame
@@ -110,38 +154,73 @@ async def find_brand_id(conn, brand_name):
 def products_management_page():
     st.title('Управление товарами в базе данных')
 
-    # Функция для работы с DataFrame
+    # Получаем данные пользователя с кешированием
+    try:
+        user_data = asyncio.run(check_customer_with_cache(st.session_state.user_id))
+        user_role = user_data.get('role')
+
+        if user_role == 'customer':  # Предполагаем, что есть роль 'admin'
+            st.error("Доступ запрещен: недостаточно прав")
+            time.sleep(2)
+            return
+
+    except Exception as e:
+        st.error(f"Ошибка загрузки данных: {str(e)}")
+        st.stop()
+
+    # Основной функционал для администраторов
     st.subheader("Интерактивный список товаров")
 
-    user_role = asyncio.run(check_customer(st.session_state.user_id))['role']
+    # Загрузка данных с индикатором прогресса
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    if user_role == 'customer':
-        st.error("Так, хулиган, что тут забыл?) БАН")
-        st.session_state.role = 'customer'
-        time.sleep(3)
-        st.rerun()
-
-    # Загружаем исходные данные
-    with st.spinner("Загружаем данные..."):
+    try:
+        status_text.text("Загрузка данных...")
         products_df = asyncio.run(get_products_dataframe())
+        progress_bar.progress(50)
 
-    if not products_df.empty:
-        original_ids = products_df['product_id'].tolist()
+        if not products_df.empty:
+            original_ids = products_df['product_id'].tolist()
 
-        edited_df = st.data_editor(
-            products_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            key="products_editor"
-        )
+            status_text.text("Подготовка интерфейса...")
+            edited_df = st.data_editor(
+                products_df,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "product_id": st.column_config.NumberColumn("ID", disabled=True),
+                    "price": st.column_config.NumberColumn("Цена", format="%.2f ₽"),
+                    "stock_quantity": st.column_config.NumberColumn("Остаток", format="%d шт")
+                },
+                key="products_editor"
+            )
+            progress_bar.progress(75)
 
-        if st.button("Сохранить изменения"):
-            if sum(edited_df[edited_df.columns[1:]].isna().any(axis=1)) > 0:
-                st.error("Заполните все поля в датасете")
-                time.sleep(3)
-                st.rerun()
+            if st.button("💾 Сохранить изменения", type="primary"):
+                if sum(edited_df[edited_df.columns[1:]].isna().any(axis=1)) > 0:
+                    st.error("Все поля должны быть заполнены!")
+                    return
 
-            asyncio.run(sync_dataframe_changes(edited_df, original_ids))
-            st.success("Изменения успешно сохранены!")
-    else:
-        st.write("📦 В базе данных пока нет товаров. Добавьте их через таблицу выше.")
+                try:
+                    with st.spinner("Сохранение изменений..."):
+                        asyncio.run(sync_dataframe_changes(edited_df, original_ids))
+                        # Очищаем кеш товаров после изменений
+                        redis_client.delete("products:data")
+                    st.success("Изменения успешно сохранены!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ошибка сохранения: {str(e)}")
+        else:
+            st.info("📦 В базе данных пока нет товаров. Добавьте их через таблицу выше.")
+
+        progress_bar.progress(100)
+        status_text.text("Готово!")
+        time.sleep(0.5)
+        progress_bar.empty()
+        status_text.empty()
+
+    except Exception as e:
+        st.error(f"Ошибка загрузки товаров: {str(e)}")
+        st.stop()

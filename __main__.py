@@ -22,13 +22,6 @@ async def main():
         except redis.ConnectionError:
             st.warning("Не удалось подключиться к Redis. Используются локальные данные сессии.")
 
-    defaults = {
-        'logged_in': False,
-        'user_id': None,
-        'cart': {},
-        'role': None,
-        'username': None
-    }
     if session_data:
         for key, value in session_data.items():
             if key not in st.session_state:

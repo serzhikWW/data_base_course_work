@@ -23,7 +23,6 @@ try:
 except ImportError:
     st.error("Redis не установлен")
 
-# ----- Асинхронное подключение к базе данных -----
 @asynccontextmanager
 async def connect_to_db():
     conn = None
@@ -66,7 +65,6 @@ async def check_customer(username):
         return user
 
 
-# ----- Интерфейс приложения -----
 def login_form():
     st.title("Вход в приложение")
 

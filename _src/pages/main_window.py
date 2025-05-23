@@ -1,6 +1,5 @@
 import streamlit as st
-import asyncio
-import asyncpg
+
 
 def main_window():
     # Название страницы

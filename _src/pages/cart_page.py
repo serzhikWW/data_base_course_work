@@ -6,6 +6,24 @@ from contextlib import asynccontextmanager
 import pickle
 from datetime import timedelta
 from _src.pages.log_user import redis_sessions
+import json
+import redis
+from redis.exceptions import RedisError
+
+# Инициализация Redis (убедитесь, что параметры подключения правильные)
+try:
+    redis_client = redis.Redis(
+        host='localhost',
+        port=6379,
+        db=0,
+        password=None,  # если есть пароль
+        decode_responses=False  # важно получить сырые bytes
+    )
+    redis_client.ping()  # проверка подключения
+except RedisError as e:
+    st.error(f"Ошибка подключения к Redis: {e}")
+    redis_client = None
+
 
 @asynccontextmanager
 async def get_db_connection():
@@ -58,22 +76,21 @@ async def load_cart_from_database(order_id):
             FROM order_items
             WHERE order_id = $1
         """
-
-        rows = await conn.fetch(query, (order_id,))
+        rows = await conn.fetch(query, order_id)
 
     cart = {}
     for row in rows:
-        product = await fetch_product_by_id(row['product_id'])  # Реализуйте эту функцию, если её нет
-        cart[row['product_id']] = {
-            'name': product['name'],
-            'price': row['unitprice'],
-            'quantity': row['quantity']
-        }
+        product = await fetch_product_by_id(row['product_id'])
+        if product:  # Проверяем, что товар найден
+            cart[row['product_id']] = {
+                'name': product[0]['name'],  # Обратите внимание на индексацию [0]
+                'price': row['unitprice'],
+                'quantity': row['quantity']
+            }
 
-    st.session_state.cart = cart  # Сохраняем корзину в session_state
+    return cart   # Сохраняем корзину в session_state
 
 async def create_new_order(customer_id):
-    """Создание новой строки в таблице orders."""
     async with get_db_connection() as conn:
         query = """
             INSERT INTO orders (customer_id, order_date, order_summ, order_state)
@@ -96,8 +113,29 @@ async def remove_item_from_order(order_id, product_id):
         """
         await conn.execute(query, order_id, product_id)
 
+
+async def remove_item_from_cart(order_id, product_id):
+    """Полное удаление товара из корзины и БД"""
+    try:
+        # Удаляем из базы данных
+        await remove_item_from_order(order_id, product_id)
+
+        # Удаляем из session_state
+        if 'cart' in st.session_state and product_id in st.session_state.cart:
+            del st.session_state.cart[product_id]
+
+        # Обновляем общую сумму
+        await update_order_summary(order_id)
+
+        # Сохраняем в Redis
+        save_cart_to_redis(st.session_state.get('user_id'), st.session_state.cart)
+
+        return True
+    except Exception as e:
+        st.error(f"Ошибка при удалении товара: {e}")
+        return False
+
 async def update_item_quantity(order_id, product_id, new_quantity):
-    """Обновление количества товара в order_items."""
     async with get_db_connection() as conn:
         query = """
             UPDATE order_items
@@ -108,7 +146,6 @@ async def update_item_quantity(order_id, product_id, new_quantity):
 
 
 async def update_order_summary(order_id):
-    """Обновление общей суммы в таблице orders."""
     async with get_db_connection() as conn:
         query = """
             UPDATE orders
@@ -122,8 +159,8 @@ async def update_order_summary(order_id):
         await conn.execute(query, order_id)
 
 
+
 async def update_product_quantity(product_id, quantity_purchased):
-    """Обновление количества товара на складе после покупки."""
     async with get_db_connection() as conn:
         query = """     UPDATE products
                         SET stock_quantity = stock_quantity - $1
@@ -132,12 +169,14 @@ async def update_product_quantity(product_id, quantity_purchased):
         await conn.execute(query, quantity_purchased, product_id)
 
 
+
 async def update_item_quantity_in_cart(product_id, new_quantity):
     """Обновление количества товара в order_items и корзине."""
-    order_id = st.session_state.order_id
-    st.session_state.cart[product_id]['quantity'] = new_quantity
-    await update_item_quantity(order_id, product_id, new_quantity)
-    await update_order_summary(order_id)
+    if new_quantity != st.session_state.cart[product_id]['quantity']:
+        asyncio.run(update_product_quantity(product_id, new_quantity))
+        st.session_state.cart[product_id]['quantity'] = new_quantity
+        save_cart_to_redis(st.session_state.user_id, st.session_state.cart)
+        st.rerun()
 
 async def payed_order(order_id):
     async with get_db_connection() as conn:
@@ -157,32 +196,60 @@ def clear_cart():
     """Очистка корзины."""
     st.session_state.cart = {}
 
+
 def get_cart_from_redis(user_id):
-    if redis_sessions:
-        cart_data = redis_sessions.get(f"cart:{user_id}")
-        return pickle.loads(cart_data) if cart_data else {}
-    return {}
+    """Безопасное получение корзины из Redis"""
+    if not redis_client:
+        return {}
+
+    try:
+        cart_data = redis_client.get(f"cart:{user_id}")
+        if cart_data:
+            return pickle.loads(cart_data)
+        return {}
+    except (pickle.PickleError, RedisError) as e:
+        st.error(f"Ошибка загрузки корзины: {e}")
+        return {}
+
 
 def save_cart_to_redis(user_id, cart):
-    if redis_sessions:
-        redis_sessions.setex(
+    """Безопасное сохранение корзины в Redis"""
+    if not redis_client:
+        return
+
+    try:
+        redis_client.setex(
             f"cart:{user_id}",
             timedelta(days=1),
-            pickle.dumps(cart))
+            pickle.dumps(cart)
+        )
+    except (pickle.PickleError, RedisError) as e:
+        st.error(f"Ошибка сохранения корзины: {e}")
 
 def cart_page(customer_id):
     """Страница корзины."""
     st.title("Корзина")
 
-    # Инициализация текущего заказа
+    if 'cart' not in st.session_state:
+        st.session_state.cart = get_cart_from_redis(customer_id) or {}
+
+    # Инициализация заказа
     if 'order_id' not in st.session_state:
-        st.session_state.order_id = asyncio.run(create_new_order(customer_id=customer_id))
+        try:
+            st.session_state.order_id = asyncio.run(create_new_order(customer_id))
+        except Exception as e:
+            st.error(f"Ошибка создания заказа: {e}")
+            return
 
     order_id = st.session_state.order_id
 
-    # Грузим корзину из базы в session_state
-    if 'cart' not in st.session_state:
-        st.session_state.cart = get_cart_from_redis(customer_id)
+    # Загружаем корзину из Redis или из базы данных
+    if not st.session_state.cart:  # Если корзина пуста
+        redis_cart = get_cart_from_redis(customer_id)
+        if redis_cart:  # Если в Redis есть данные
+            st.session_state.cart = redis_cart
+        else:  # Иначе загружаем из базы
+            st.session_state.cart = asyncio.run(load_cart_from_database(order_id))
 
     cart_items = st.session_state.cart
 
@@ -216,24 +283,30 @@ def cart_page(customer_id):
                 st.rerun()
 
             with col1:
-
-
                 new_quantity = st.number_input(
                     f"Изменить количество для {item['name']}:",
-                    value=item['quantity'], min_value=1, max_value=product_info[0]['stock_quantity'], step=1, key=f"edit_quantity_{product_id}"
+                    value=item['quantity'],
+                    min_value=1,
+                    max_value=product_info[0]['stock_quantity'],
+                    step=1,
+                    key=f"edit_quantity_{product_id}",
+                    on_change=lambda: update_item_quantity_in_cart(product_id, new_quantity)
                 )
-                if new_quantity != item['quantity']:
-                    asyncio.run(update_item_quantity_in_cart(product_id, new_quantity))
-                    st.success(f"Количество для '{item['name']}' обновлено до {new_quantity} шт.")
-                    time.sleep(2)
-                    st.rerun()
 
             with col2:
                 if st.button(f"❌ Удалить {item['name']}", key=f"remove_{product_id}"):
-                    asyncio.run(remove_item_from_order(order_id, product_id))
-                    del st.session_state.cart[product_id]
-                    st.warning(f"Товар '{item['name']}' удален из корзины.")
-                    st.rerun()
+                    with st.spinner("Удаляем товар..."):
+                        success = asyncio.run(remove_item_from_cart(
+                            st.session_state.order_id,
+                            product_id
+                        ))
+
+                    if success:
+                        st.success(f"Товар '{item['name']}' удален из корзины")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Не удалось удалить товар")
 
         update_order_summary(order_id)
         total_summ = get_cart_total()
@@ -243,7 +316,7 @@ def cart_page(customer_id):
         with col1:
             if st.button("Очистить корзину"):
                 for product_id in list(cart_items.keys()):
-                    asyncio.run(remove_item_from_order(order_id, product_id))
+                    asyncio.run(remove_item_from_cart(order_id, product_id))
                 clear_cart()
                 st.success("Корзина очищена.")
                 time.sleep(2)
@@ -259,6 +332,9 @@ def cart_page(customer_id):
                     with st.spinner("Выполняется покупка, зачильтесь и полюбуйтесь на спиннер :)"):
                         asyncio.run(payed_order(order_id))
                         asyncio.run(update_user_balance(customer_id, user_balance - total_summ))
+
+                        for product_id in list(cart_items.keys()):
+                            asyncio.run(remove_item_from_cart(order_id, product_id))
 
                         clear_cart()
                         del st.session_state.order_id
